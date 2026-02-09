@@ -1,0 +1,5 @@
+# Ashita per-character settings (generated at runtime)
+settings/
+
+# Export output (user data, not source)
+exports/*.xls
