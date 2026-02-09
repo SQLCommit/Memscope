@@ -163,12 +163,6 @@ Note: `AddonManager` API exists in annotations but is only accessible from C++ p
 - **Action flags**: UI sets flags, d3d_present processes them (decouples rendering from logic)
 - **Safe text_in**: Never print() from text_in handler (causes recursive crash); uses debug buffer flushed from d3d_present
 
-### Limitations
-- Per-addon data has configurable update latency (default 30 seconds)
-- Native allocations (C++ side) not visible per-addon
-- Plugin memory is opaque (Addons.dll internals)
-- FFXI is 32-bit: 2 GB virtual limit (4 GB with Large Address Aware patch)
-
 ## Version History
 
 ### v1.0.0
