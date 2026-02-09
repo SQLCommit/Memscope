@@ -16,8 +16,9 @@ A comprehensive memory monitoring tool that tracks per-addon memory usage, proce
 
 ## Requirements
 
-- Ashita v4.30+ (uses built-in ImGui 1.92.3)
-- Windows (uses FFI for native memory APIs)
+- Ashita v4.30
+	- This release has only been tested with Ashita v4.3
+
 
 ## Installation
 
