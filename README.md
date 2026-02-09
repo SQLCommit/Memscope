@@ -17,7 +17,7 @@ A comprehensive memory monitoring tool that tracks per-addon memory usage, proce
 ## Requirements
 
 - Ashita v4.30
-	- This release has only been tested with Ashita v4.3
+	- This release has only been tested with Ashita v4.30
 
 
 ## Installation
