@@ -1,9 +1,9 @@
 --[[
-    MemScope v1.0.0 - Monitor Module
+    MemScope v1.0.1 - Monitor Module
     FFI for Windows memory APIs, /addon list capture, GC monitoring.
 ]]--
 
-local ffi = require('ffi');
+local ffi = require 'ffi';
 
 local monitor = {};
 
@@ -103,6 +103,12 @@ local function define_ffi()
             HANDLE GetCurrentProcess(void);
             BOOL K32GetProcessMemoryInfo(HANDLE Process, PROCESS_MEMORY_COUNTERS* ppsmemCounters, DWORD cb);
             BOOL GlobalMemoryStatusEx(MEMORYSTATUSEX* lpBuffer);
+
+            // Working set trim — from atom0s's freemem addon.
+            // Passing (-1, -1) tells Windows to trim the working set to its minimum,
+            // releasing pages the OS is holding onto lazily. Shows actual memory usage
+            // vs Win10/11 inflated values.
+            BOOL SetProcessWorkingSetSize(HANDLE hProcess, SIZE_T dwMinimumWorkingSetSize, SIZE_T dwMaximumWorkingSetSize);
         ]];
     end);
     return ok;
@@ -117,7 +123,7 @@ function monitor.init(shared_state)
     -- Initialize FFI with safety
     local ok = define_ffi();
     if ok then
-        local pok, perr = pcall(function()
+        local pok, _ = pcall(function()
             process_handle = ffi.C.GetCurrentProcess();
             mem_counters = ffi.new('PROCESS_MEMORY_COUNTERS');
             mem_counters.cb = ffi.sizeof('PROCESS_MEMORY_COUNTERS');
@@ -127,7 +133,7 @@ function monitor.init(shared_state)
 
     -- Initialize system memory query struct
     if ffi_available then
-        local sok, serr = pcall(function()
+        local sok, _ = pcall(function()
             mem_status = ffi.new('MEMORYSTATUSEX');
             mem_status.dwLength = ffi.sizeof('MEMORYSTATUSEX');
         end);
@@ -188,6 +194,30 @@ function monitor.query_lua_memory()
     if addon.instance then
         state.current.own_memory_kb = addon.instance:get_memory_usage() * BYTES_TO_KB;
     end
+end
+
+-------------------------------------------------------------------------------
+-- Working Set Trim
+-- Technique from atom0s's freemem addon (Ashita built-in).
+-- SetProcessWorkingSetSize(-1, -1) forces Windows to release pages it is
+-- holding onto lazily. Win10/11 inflates Working Set values — trimming shows
+-- the actual memory footprint. Safe to call; the OS will page back in as needed.
+-------------------------------------------------------------------------------
+function monitor.trim_working_set()
+    if not ffi_available then return 0, 0; end
+
+    -- Read working set before trim
+    ffi.C.K32GetProcessMemoryInfo(process_handle, mem_counters, mem_counters.cb);
+    local before_mb = tonumber(mem_counters.WorkingSetSize) * BYTES_TO_MB;
+
+    -- Trim
+    ffi.C.SetProcessWorkingSetSize(process_handle, -1, -1);
+
+    -- Read working set after trim
+    ffi.C.K32GetProcessMemoryInfo(process_handle, mem_counters, mem_counters.cb);
+    local after_mb = tonumber(mem_counters.WorkingSetSize) * BYTES_TO_MB;
+
+    return before_mb, after_mb;
 end
 
 -------------------------------------------------------------------------------
@@ -288,11 +318,6 @@ end
 --- Returns true if a capture is currently in progress.
 function monitor.is_capturing()
     return capture.active;
-end
-
---- Returns true if the current capture is a debug capture.
-function monitor.is_debug_capture()
-    return capture.active and capture.debug;
 end
 
 --- Called from d3d_present to check for capture timeout.

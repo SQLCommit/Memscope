@@ -1,9 +1,15 @@
 --[[
-    MemScope v1.0.0 - UI Module
+    MemScope v1.0.1 - UI Module
     ImGui dashboard rendering with correct widget patterns.
+
+    Data accuracy notes (per atom0s, Feb 2026):
+    - /addon list memory = Lua-tracked only (excludes FFI, ImGui, C++ internals)
+    - Working set on Win10/11 is inflated (OS delays page release)
+    - GC monitoring only sees this addon's own Lua state
+    - Growth alerts are informational, not confirmed leaks
 ]]--
 
-local imgui = require('imgui');
+local imgui = require 'imgui';
 
 local ui = {};
 
@@ -92,8 +98,12 @@ local function render_process_memory()
     help_marker(
         'Memory used by the entire FFXI process.\n' ..
         'FFXI is 32-bit: 2 GB limit (4 GB with LAA patch).\n' ..
-        'Bars show usage vs the process virtual address limit.\n' ..
-        'Hover bars for peak, delta, and system info.'
+        'Bars show usage vs the process virtual address limit.\n\n' ..
+        'NOTE: Windows 10/11 inflates Working Set values.\n' ..
+        'The OS holds onto memory pages aggressively and\n' ..
+        'delays releasing them. Actual usage may be much\n' ..
+        'lower than reported. Use the Trim button above\n' ..
+        'to force a working set trim for accurate readings.'
     );
     imgui.Separator();
 
@@ -105,7 +115,11 @@ local function render_process_memory()
     local ws_label = string_format('%.0f / %.0f MB (%.0f%%)', c.working_set_mb, vlimit, ws_pct * 100);
     imgui.Text('Working Set:');
     if imgui.IsItemHovered() then
-        imgui.SetTooltip('Physical RAM pages mapped into FFXI\'s address space.');
+        imgui.SetTooltip(
+            'Physical RAM pages mapped into FFXI\'s address space.\n' ..
+            'Win10/11 inflates this — OS delays page release.\n' ..
+            'Use the Trim button to see actual values.'
+        );
     end
     imgui.SameLine();
     imgui.ProgressBar(ws_pct, { -1, 0 }, ws_label);
@@ -168,20 +182,32 @@ end
 local function render_lua_memory()
     imgui.Text('Lua Memory');
     help_marker(
-        'Memory used by Lua addon scripts.\n' ..
-        'Each addon has its own isolated Lua state.\n' ..
-        '"All Addons Total" is the sum from /addon list.'
+        'Memory tracked by Lua addon scripts.\n' ..
+        'Each addon runs in its own isolated Lua state.\n' ..
+        '"All Addons Total" is the sum from /addon list.\n\n' ..
+        'IMPORTANT: These values only reflect Lua-tracked\n' ..
+        'memory. FFI allocations, ImGui resources, and\n' ..
+        'C++ internals are NOT included. Actual addon\n' ..
+        'memory usage may be higher than shown.'
     );
     imgui.Separator();
 
     imgui.Text(string_format('MemScope Lua State: %s', fmt_mem(state.current.own_lua_kb or 0)));
     if imgui.IsItemHovered() then
-        imgui.SetTooltip('Memory used by this addon\'s own Lua VM (tables, strings, functions).');
+        imgui.SetTooltip(
+            'Memory used by this addon\'s own Lua VM.\n' ..
+            'Only includes Lua-managed objects (tables, strings,\n' ..
+            'functions). Does not include FFI allocations.'
+        );
     end
 
     imgui.Text(string_format('All Addons Total: %s', fmt_mem(state.current.addon_total_kb or 0)));
     if imgui.IsItemHovered() then
-        imgui.SetTooltip('Combined memory of all loaded addons (from /addon list).');
+        imgui.SetTooltip(
+            'Combined Lua-tracked memory of all loaded addons\n' ..
+            '(from /addon list). This understates actual usage —\n' ..
+            'FFI, ImGui, and manual C allocations are excluded.'
+        );
     end
 
     if state.settings.auto_gc_monitoring and state.gc then
@@ -189,9 +215,11 @@ local function render_lua_memory()
             state.gc.collections, fmt_mem(state.gc.freed_kb)));
         if imgui.IsItemHovered() then
             imgui.SetTooltip(
-                'Lua garbage collector activity for this addon.\n' ..
+                'Lua garbage collector activity for MemScope only.\n' ..
+                'Each addon has its own isolated GC — this does\n' ..
+                'NOT show GC activity of other addons.\n' ..
                 'Collections: times GC has reclaimed memory.\n' ..
-                'Freed: amount reclaimed in the last GC cycle.'
+                'Freed: amount reclaimed in the last cycle.'
             );
         end
     end
@@ -206,7 +234,12 @@ local function render_addon_table()
     if not state.settings.show_addon_breakdown then return; end
 
     imgui.Text(string_format('Addon Memory (%d tracked)', #state.addon_order));
-    help_marker('Click a row for details. Right-click unloaded addons to remove.');
+    help_marker(
+        'Click a row for details. Right-click unloaded addons to remove.\n\n' ..
+        'Values are Lua-tracked memory only (from /addon list).\n' ..
+        'FFI, ImGui, and C++ allocations are not reflected.\n' ..
+        'Trend/delta may show normal LuaJIT jitting behavior.'
+    );
     imgui.Separator();
 
     local table_flags = ImGuiTableFlags_Resizable
@@ -258,7 +291,7 @@ local function render_addon_table()
                 imgui.PushStyleColor(ImGuiCol_Text, { 0.5, 0.5, 0.5, 0.6 });
                 needs_pop = true;
             elseif data.alert_active then
-                imgui.PushStyleColor(ImGuiCol_Text, { 1.0, 0.3, 0.3, 1.0 });
+                imgui.PushStyleColor(ImGuiCol_Text, { 1.0, 0.6, 0.2, 1.0 });
                 needs_pop = true;
             elseif name == addon.name then
                 imgui.PushStyleColor(ImGuiCol_Text, { 0.5, 0.8, 0.5, 1.0 });
@@ -414,13 +447,17 @@ local function render_addon_detail()
 
     imgui.Text(string_format('Current: %s', fmt_mem(data.memory_kb)));
     imgui.Text(string_format('Peak: %s', fmt_mem(data.peak_kb)));
-    imgui.Text(string_format('Min: %s', fmt_mem(data.min_kb == 999999 and 0 or data.min_kb)));
+    imgui.Text(string_format('Min: %s', fmt_mem(data.min_kb == analysis.MIN_KB_SENTINEL and 0 or data.min_kb)));
     imgui.Text(string_format('Trend: %.3f KB/sec', data.trend_slope));
     if imgui.IsItemHovered() then
         imgui.SetTooltip(
             'Exponential moving average of delta (rate of change).\n' ..
             'Positive = growing, Negative = shrinking.\n' ..
-            'Requires 3+ samples for accuracy.'
+            'Requires 3+ samples for accuracy.\n\n' ..
+            'NOTE: Positive trends are often normal. LuaJIT compiles\n' ..
+            'hot paths (loops with 56+ iterations, frequent calls)\n' ..
+            'into machine code (up to ~2 MB cache). This growth is\n' ..
+            'expected behavior, not a leak.'
         );
     end
     imgui.Text(string_format('Samples: %d', data.history_count));
@@ -511,12 +548,25 @@ local function render_settings()
             state.settings_save_requested = true;
         end
 
+        v = { state.settings.auto_gc_monitoring };
+        if imgui.Checkbox('Auto GC Monitoring', v) then
+            state.settings.auto_gc_monitoring = v[1];
+            state.settings_save_requested = true;
+        end
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Track garbage collection events for MemScope\'s own Lua state.\nOther addons have isolated GC — only this addon\'s GC is visible.');
+        end
+
         imgui.Spacing();
         imgui.Text('Alerts');
         help_marker(
-            'Alerts warn you in chat when an addon may be leaking memory.\n' ..
-            'Leak: sustained growth detected via EMA of delta.\n' ..
-            'Spike: sudden large increase between consecutive polls.'
+            'Alerts notify you in chat about unusual memory patterns.\n' ..
+            'Growth: sustained increase detected via EMA of delta.\n' ..
+            'Spike: sudden large jump between consecutive polls.\n\n' ..
+            'IMPORTANT: These alerts are informational only.\n' ..
+            'LuaJIT jits code after 56 loop iterations, which\n' ..
+            'causes normal memory growth (up to ~2 MB cache).\n' ..
+            'Most alerts are NOT actual leaks — investigate first.'
         );
         imgui.Separator();
 
@@ -526,17 +576,19 @@ local function render_settings()
             state.settings_save_requested = true;
         end
 
-        v = { state.settings.leak_threshold };
-        if imgui.SliderFloat('Leak Threshold (KB/sec)', v, 1.0, 200.0, '%.1f') then
-            state.settings.leak_threshold = v[1];
+        v = { state.settings.growth_threshold };
+        if imgui.SliderFloat('Growth Threshold (KB/sec)', v, 1.0, 200.0, '%.1f') then
+            state.settings.growth_threshold = v[1];
             state.settings_save_requested = true;
         end
         if imgui.IsItemHovered() then
             imgui.SetTooltip(
-                'Sustained growth rate that triggers a leak warning.\n' ..
+                'Sustained growth rate that triggers an informational alert.\n' ..
                 'Measured via EMA of delta (3+ samples).\n' ..
-                'Default 10 KB/s = ~600 KB/min steady growth.\n' ..
-                'Lower = more sensitive, higher = fewer false alarms.'
+                'Default 50 KB/s. Higher = fewer notifications.\n\n' ..
+                'NOTE: LuaJIT jitting causes normal memory growth.\n' ..
+                'Most alerts are false positives — investigate\n' ..
+                'before assuming a real leak exists.'
             );
         end
 
@@ -652,7 +704,7 @@ local function render_full()
     end
 
     if imgui.Begin('MemScope', is_open, ImGuiWindowFlags_NoScrollbar + ImGuiWindowFlags_NoScrollWithMouse) then
-        -- Toolbar: [Pause] [Refresh] | [Export] [GC] | [Settings] [Compact]  Samples
+        -- Toolbar: [Pause] [Refresh] | [Export] [GC] [Trim] | [Settings] [Compact]  Samples
         if imgui.Button(state.paused and 'Resume' or 'Pause') then
             state.paused = not state.paused;
         end
@@ -680,7 +732,23 @@ local function render_full()
             state.force_gc = true;
         end
         if imgui.IsItemHovered() then
-            imgui.SetTooltip('Force Lua garbage collection.\nShows how much memory was reclaimed.');
+            imgui.SetTooltip(
+                'Force Lua garbage collection for MemScope only.\n' ..
+                'Each addon has its own isolated Lua state —\n' ..
+                'this does NOT affect other addons\' memory.'
+            );
+        end
+        imgui.SameLine();
+        if imgui.Button('Trim') then
+            state.force_trim = true;
+        end
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip(
+                'Trim the process working set (from atom0s\'s freemem addon).\n' ..
+                'Releases pages Windows is holding onto lazily.\n' ..
+                'Win10/11 inflates Working Set — trimming shows\n' ..
+                'actual memory usage. Safe; OS pages back as needed.'
+            );
         end
         imgui.SameLine();
         imgui.TextDisabled('|');

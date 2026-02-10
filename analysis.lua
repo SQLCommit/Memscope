@@ -1,6 +1,11 @@
 --[[
-    MemScope v1.0.0 - Analysis Engine
-    Ring buffers, trend analysis, leak/spike detection, addon pool management.
+    MemScope v1.0.1 - Analysis Engine
+    Ring buffers, trend analysis, growth/spike observation, addon pool management.
+
+    NOTE: Per-addon memory from /addon list only reflects Lua-tracked memory.
+    FFI allocations, ImGui usage, and C++ internals are not included.
+    LuaJIT jitting causes normal memory growth patterns that are not leaks.
+    (Clarified by atom0s, Feb 2026)
 ]]--
 
 local analysis = {};
@@ -13,6 +18,7 @@ local ADDON_HISTORY_SIZE = 120;
 local MAX_TRACKED_ADDONS = 64;
 local MIN_SAMPLES_FOR_TREND = 3;
 local TREND_ALPHA = 0.3;  -- EMA weight: 0.3 = responsive, 0.1 = smooth
+local MIN_KB_SENTINEL = 999999;  -- Initial min_kb value (replaced on first real sample)
 
 -------------------------------------------------------------------------------
 -- Cached References
@@ -35,6 +41,7 @@ analysis.HISTORY_SIZE = HISTORY_SIZE;
 analysis.ADDON_HISTORY_SIZE = ADDON_HISTORY_SIZE;
 analysis.MAX_TRACKED_ADDONS = MAX_TRACKED_ADDONS;
 analysis.MIN_SAMPLES_FOR_TREND = MIN_SAMPLES_FOR_TREND;
+analysis.MIN_KB_SENTINEL = MIN_KB_SENTINEL;
 
 -------------------------------------------------------------------------------
 -- Ring Buffer Operations (zero allocation after init)
@@ -84,6 +91,8 @@ function analysis.init(shared_state)
     state.addon_order = {};
     state.addon_pool = {};
     state.pool_index = 1;
+    state.pool_free = {};       -- Free list: reclaimed pool indices for reuse
+    state.pool_free_count = 0;
 
     -- Pre-allocate addon data pool
     for i = 1, MAX_TRACKED_ADDONS do
@@ -92,7 +101,7 @@ function analysis.init(shared_state)
             memory_kb = 0,
             status = 'Unknown',
             peak_kb = 0,
-            min_kb = 999999,
+            min_kb = MIN_KB_SENTINEL,
             last_delta = 0,
             trend_slope = 0,
             history = {},
@@ -127,17 +136,24 @@ end
 local function get_or_create_addon_data(name)
     local data = state.addons[name];
     if not data then
-        if state.pool_index > MAX_TRACKED_ADDONS then
+        -- Try free list first, then fresh pool slot
+        if state.pool_free_count > 0 then
+            local idx = state.pool_free[state.pool_free_count];
+            state.pool_free[state.pool_free_count] = nil;
+            state.pool_free_count = state.pool_free_count - 1;
+            data = state.addon_pool[idx];
+        elseif state.pool_index <= MAX_TRACKED_ADDONS then
+            data = state.addon_pool[state.pool_index];
+            state.pool_index = state.pool_index + 1;
+        else
             return nil;
         end
-        data = state.addon_pool[state.pool_index];
-        state.pool_index = state.pool_index + 1;
 
         data.name = name;
         data.memory_kb = 0;
         data.status = 'Unknown';
         data.peak_kb = 0;
-        data.min_kb = 999999;
+        data.min_kb = MIN_KB_SENTINEL;
         data.last_delta = 0;
         data.trend_slope = 0;
         data.history_head = 1;
@@ -179,18 +195,22 @@ end
 local function check_addon_alerts(data)
     if not state.settings.alerts_enabled then return; end
 
-    -- Leak detection (sustained growth)
-    if data.trend_slope > state.settings.leak_threshold then
+    -- Growth observation (sustained increase)
+    -- NOTE: LuaJIT jitting and normal Lua VM behavior can cause sustained growth
+    -- that is NOT a leak. These alerts are informational only — investigate before
+    -- concluding there is an actual problem. (Clarified by atom0s)
+    if data.trend_slope > state.settings.growth_threshold then
         if not data.alert_active then
             data.alert_active = true;
-            add_alert(data.name, 'leak',
-                string_format('Potential leak: %.2f KB/sec sustained growth', data.trend_slope));
+            add_alert(data.name, 'growth',
+                string_format('Sustained growth: %.2f KB/sec (may be normal LuaJIT behavior)', data.trend_slope));
         end
     else
         data.alert_active = false;
     end
 
-    -- Spike detection (requires both % threshold AND minimum absolute change)
+    -- Spike observation (requires both % threshold AND minimum absolute change)
+    -- NOTE: LuaJIT hot-path compilation can cause legitimate memory jumps.
     if data.history_count >= 2 then
         local prev_idx = (data.history_head - 2) % ADDON_HISTORY_SIZE + 1;
         local prev = data.history[prev_idx];
@@ -200,7 +220,7 @@ local function check_addon_alerts(data)
             local min_abs = state.settings.spike_min_kb or 512;
             if pct_change > state.settings.spike_threshold and abs_change > min_abs then
                 add_alert(data.name, 'spike',
-                    string_format('Memory spike: %.1f%% increase (%.2f -> %.2f KB)',
+                    string_format('Memory jump: %.1f%% increase (%.2f -> %.2f KB)',
                         pct_change, prev, data.memory_kb));
             end
         end
@@ -304,30 +324,30 @@ analysis.SORT_TREND  = 4;
 
 function analysis.sort_addons(col_id, ascending)
     table_sort(state.addon_order, function(a, b)
-        local da = state.addons[a];
-        local db_data = state.addons[b];
-        if not da or not db_data then return false; end
+        local data_a = state.addons[a];
+        local data_b = state.addons[b];
+        if not data_a or not data_b then return false; end
 
         -- Unloaded always at bottom regardless of sort
-        local a_loaded = da.status ~= 'Unloaded';
-        local b_loaded = db_data.status ~= 'Unloaded';
+        local a_loaded = data_a.status ~= 'Unloaded';
+        local b_loaded = data_b.status ~= 'Unloaded';
         if a_loaded ~= b_loaded then
             return a_loaded;
         end
 
         local va, vb;
         if col_id == 0 then         -- Name
-            va, vb = da.name:lower(), db_data.name:lower();
+            va, vb = data_a.name:lower(), data_b.name:lower();
         elseif col_id == 1 then     -- Memory
-            va, vb = da.memory_kb, db_data.memory_kb;
+            va, vb = data_a.memory_kb, data_b.memory_kb;
         elseif col_id == 2 then     -- Status
-            va, vb = da.status, db_data.status;
+            va, vb = data_a.status, data_b.status;
         elseif col_id == 3 then     -- Delta
-            va, vb = da.last_delta, db_data.last_delta;
+            va, vb = data_a.last_delta, data_b.last_delta;
         elseif col_id == 4 then     -- Trend
-            va, vb = da.trend_slope, db_data.trend_slope;
+            va, vb = data_a.trend_slope, data_b.trend_slope;
         else
-            va, vb = da.memory_kb, db_data.memory_kb;
+            va, vb = data_a.memory_kb, data_b.memory_kb;
         end
 
         if ascending then
@@ -342,6 +362,18 @@ end
 -- Public: Remove a specific addon from tracking
 -------------------------------------------------------------------------------
 function analysis.remove_addon(name)
+    -- Find pool index for free list reclamation
+    local data = state.addons[name];
+    if data then
+        for i = 1, state.pool_index - 1 do
+            if state.addon_pool[i] == data then
+                state.pool_free_count = state.pool_free_count + 1;
+                state.pool_free[state.pool_free_count] = i;
+                break;
+            end
+        end
+    end
+
     -- Remove from lookup table
     state.addons[name] = nil;
 

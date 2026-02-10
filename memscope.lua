@@ -1,27 +1,45 @@
 --[[
-    MemScope v1.0.0 - Memory Monitoring Addon for Ashita v4
+    MemScope v1.0.1 - Memory Monitoring Addon for Ashita v4
 
-    Tracks per-addon memory usage via /addon list capture, process memory
-    via Windows FFI, and provides leak detection with historical analysis.
+    Tracks per-addon Lua memory via /addon list capture, process memory
+    via Windows FFI, and provides growth analysis with historical trends.
+
+    NOTE: Per-addon values reflect Lua-tracked memory only. FFI, ImGui,
+    and C++ allocations are excluded. Growth alerts are informational —
+    LuaJIT jitting causes normal memory increases that are not leaks.
+
+    Commands:
+        /memscope              - Toggle the MemScope window
+        /memscope show / hide  - Show or hide the window
+        /memscope compact      - Toggle compact overlay mode
+        /memscope resetui      - Reset window size and position
+        /memscope pause        - Pause/resume data collection
+        /memscope snapshot     - Take manual memory snapshot
+        /memscope report       - Print memory report to chat
+        /memscope export       - Export session data to Excel (.xls)
+        /memscope gc           - Force garbage collection (this addon only)
+        /memscope trim         - Trim working set (actual vs inflated memory)
+        /memscope alerts [on/off] - Toggle growth alerts
+        /memscope debug        - Debug addon list capture
 
     Author: SQLCommit
-    Version: 1.0.0
+    Version: 1.0.1
 ]]--
 
 addon.name    = 'memscope';
 addon.author  = 'SQLCommit';
-addon.version = '1.0.0';
-addon.desc    = 'Memory monitoring and leak detection for Ashita addons';
+addon.version = '1.0.1';
+addon.desc    = 'Memory monitoring and analysis for Ashita addons';
 addon.link    = 'https://github.com/SQLCommit/memscope';
 
 require 'common';
 
-local chat     = require('chat');
-local settings = require('settings');
+local chat     = require 'chat';
+local settings = require 'settings';
 
-local analysis = require('analysis');
-local monitor  = require('monitor');
-local ui       = require('ui');
+local analysis = require 'analysis';
+local monitor  = require 'monitor';
+local ui       = require 'ui';
 
 -------------------------------------------------------------------------------
 -- Default Settings
@@ -33,8 +51,8 @@ local default_settings = T{
     show_addon_breakdown = true,
     show_charts         = true,
     chart_height        = 80,
-    alerts_enabled      = true,
-    leak_threshold      = 10.0,
+    alerts_enabled      = false,    -- Off by default: most alerts are false positives from LuaJIT jitting
+    growth_threshold    = 50.0,    -- Raised from 10 — lower values trigger on normal LuaJIT behavior
     spike_threshold     = 100,
     spike_min_kb        = 512,
     auto_gc_monitoring  = true,
@@ -73,16 +91,23 @@ local state = {
     -- UI state
     ui_selected_addon = nil,
 
+    -- Session
+    session_start = 0,
+
     -- Action flags (decouple UI from logic)
     paused = false,
     force_refresh = false,
     force_gc = false,
+    force_trim = false,
+    force_export = false,
+    remove_addon = nil,
     settings_save_requested = false,
 
     -- Populated by modules:
     -- state.history (analysis)
     -- state.addons, state.addon_order, state.addon_pool (analysis)
     -- state.alerts, state.alert_head, state.alert_count (analysis)
+    -- state.sort_col, state.sort_asc (analysis)
     -- state.gc (monitor)
 };
 
@@ -225,7 +250,7 @@ local function export_session()
     for _, name in ipairs(state.addon_order) do
         local data = state.addons[name];
         if data then
-            local min_kb = data.min_kb == 999999 and 0 or data.min_kb;
+            local min_kb = data.min_kb == analysis.MIN_KB_SENTINEL and 0 or data.min_kb;
             f:write(string_format('<Row>%s%s%s%s%s%s%s%s%s</Row>\n',
                 scell(data.name),
                 ncell(string_format('%.2f', data.memory_kb)),
@@ -325,7 +350,7 @@ local function export_session()
             f:write(string_format('<Row>%s%s</Row>\n', scell('Status'), scell(data.status)));
             f:write(string_format('<Row>%s%s</Row>\n', scell('Current KB'), ncell(string_format('%.2f', data.memory_kb))));
             f:write(string_format('<Row>%s%s</Row>\n', scell('Peak KB'), ncell(string_format('%.2f', data.peak_kb))));
-            local min_kb = data.min_kb == 999999 and 0 or data.min_kb;
+            local min_kb = data.min_kb == analysis.MIN_KB_SENTINEL and 0 or data.min_kb;
             f:write(string_format('<Row>%s%s</Row>\n', scell('Min KB'), ncell(string_format('%.2f', min_kb))));
             f:write(string_format('<Row>%s%s</Row>\n', scell('Trend'), ncell(string_format('%.6f', data.trend_slope))));
             f:write(string_format('<Row>%s%s</Row>\n', scell('Samples'), ncell(data.history_count)));
@@ -409,7 +434,7 @@ ashita.events.register('load', 'memscope_load', function()
     state.last_sample_time = now;
     state.last_addon_poll_time = now - state.settings.addon_poll_interval + 3;
 
-    msg('v1.0.0 loaded. Use /memscope to toggle window.');
+    msg('v1.0.1 loaded. Use /memscope to toggle window.');
 end);
 
 -------------------------------------------------------------------------------
@@ -432,8 +457,8 @@ ashita.events.register('text_in', 'memscope_text_in', function(e)
     if text_in_guard then return; end
     text_in_guard = true;
 
-    local should_block = monitor.process_text_in(e.message_modified);
-    if should_block then
+    local ok, should_block = pcall(monitor.process_text_in, e.message_modified);
+    if ok and should_block then
         e.blocked = true;
     end
 
@@ -486,6 +511,9 @@ ashita.events.register('command', 'memscope_command', function(e)
         local after = collectgarbage('count');
         msg(string_format('GC freed %.2f KB', before - after));
 
+    elseif cmd == 'trim' then
+        state.force_trim = true;
+
     elseif cmd == 'alerts' then
         local subcmd = (#args >= 3) and args[3]:lower() or 'status';
         if subcmd == 'on' then
@@ -526,8 +554,9 @@ ashita.events.register('command', 'memscope_command', function(e)
         print('  /memscope snapshot - Take manual snapshot');
         print('  /memscope report - Print memory report');
         print('  /memscope export - Export session data to Excel (.xls)');
-        print('  /memscope gc - Force garbage collection');
-        print('  /memscope alerts [on/off] - Toggle alerts');
+        print('  /memscope gc - Force garbage collection (this addon only)');
+        print('  /memscope trim - Trim working set (shows actual vs inflated memory)');
+        print('  /memscope alerts [on/off] - Toggle growth alerts');
         print('  /memscope debug - Debug addon list capture');
 
     else
@@ -558,6 +587,14 @@ ashita.events.register('d3d_present', 'memscope_render', function()
         collectgarbage('collect');
         local after = collectgarbage('count');
         msg(string_format('GC freed %.2f KB', before - after));
+        collect_sample();
+    end
+
+    if state.force_trim then
+        state.force_trim = false;
+        local before_mb, after_mb = monitor.trim_working_set();
+        msg(string_format('Working Set trimmed: %.0f MB -> %.0f MB (freed %.0f MB)',
+            before_mb, after_mb, before_mb - after_mb));
         collect_sample();
     end
 

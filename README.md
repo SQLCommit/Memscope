@@ -1,15 +1,15 @@
-# MemScope v1.0.0 - Memory Monitoring Addon for Ashita v4
+# MemScope v1.0.1 - Memory Monitoring Addon for Ashita v4
 
-A comprehensive memory monitoring tool that tracks per-addon memory usage, process memory, and provides leak detection with historical analysis.
+A memory monitoring tool that tracks per-addon Lua memory, process memory, and provides growth analysis with historical trends.
 
 ## Features
 
 - **Process Memory Tracking** - Working set, page file, and peak usage via Windows APIs (FFI)
 - **Per-Addon Memory Breakdown** - Polling via `/addon list` capture with silent interception
 - **Historical Trends** - Ring buffer storage with configurable history (720 process samples, 120 per addon)
-- **Leak Detection** - EMA (exponential moving average) of delta to detect sustained memory growth
-- **Spike Detection** - Alerts on sudden memory increases (% threshold + minimum absolute change)
-- **GC Monitoring** - Track garbage collection events and freed memory
+- **Growth Observation** - EMA (exponential moving average) of delta to observe sustained memory changes
+- **Spike Observation** - Informational alerts on sudden memory increases (% threshold + minimum absolute change)
+- **GC Monitoring** - Track garbage collection events and freed memory (this addon's Lua state only)
 - **ImGui Dashboard** - Real-time visualization with charts, sortable tables, and compact mode
 - **Export to Excel** - Session data exported as `.xls` with multiple worksheet tabs
 - **Pre-allocated Buffers** - Ring buffers, object pools, cached chart data (zero per-frame allocation)
@@ -18,7 +18,6 @@ A comprehensive memory monitoring tool that tracks per-addon memory usage, proce
 
 - Ashita v4.30
 	- This release has only been tested with Ashita v4.30
-
 
 ## Installation
 
@@ -37,8 +36,9 @@ A comprehensive memory monitoring tool that tracks per-addon memory usage, proce
 | `/memscope snapshot` | Take a manual memory snapshot |
 | `/memscope report` | Print memory report to chat |
 | `/memscope export` | Export session data to Excel (.xls) |
-| `/memscope gc` | Force garbage collection |
-| `/memscope alerts [on/off]` | Toggle leak/spike alerts |
+| `/memscope gc` | Force garbage collection (this addon only) |
+| `/memscope trim` | Trim working set (shows actual vs inflated memory) |
+| `/memscope alerts [on/off]` | Toggle growth/spike alerts |
 | `/memscope resetui` | Reset window size and position to defaults |
 | `/memscope debug` | Debug addon list capture (writes to debug.log) |
 | `/memscope help` | Show command help |
@@ -49,7 +49,7 @@ A comprehensive memory monitoring tool that tracks per-addon memory usage, proce
 memscope/
   memscope.lua   -- Entry point, events, commands, state, export
   monitor.lua    -- FFI + /addon list capture + GC monitoring
-  analysis.lua   -- Ring buffers, trend/leak/spike analysis, addon pool
+  analysis.lua   -- Ring buffers, trend/growth/spike analysis, addon pool
   ui.lua         -- ImGui dashboard rendering
   README.md      -- This file
   LICENSE        -- MIT License
@@ -67,17 +67,17 @@ Settings are managed by Ashita's settings module and saved per-character under `
 - Hover for peak values, deltas, and system memory info
 
 ### Lua Memory
-- MemScope's own Lua state memory
-- All loaded addons combined total (from `/addon list`)
-- GC collection statistics (count and last freed amount)
+- MemScope's own Lua state memory (this addon only)
+- All loaded addons combined total (from `/addon list` — Lua-tracked memory only, see Data Accuracy below)
+- GC collection statistics (count and last freed amount — MemScope's own GC only)
 
 ### Addon Breakdown
 Sortable, scrollable table (click column headers to sort). Displays up to 10 rows before scrolling, with frozen header row:
-- **Name** - Addon name (color-coded: red=leak alert, green=self)
-- **Memory** - Current memory usage
+- **Name** - Addon name (color-coded: orange=growth alert, green=self)
+- **Memory** - Current Lua-tracked memory (excludes FFI/ImGui/C++ allocations)
 - **Status** - Running/Ok/Unloaded
 - **Delta** - Memory change per second (green=decreasing, red=increasing)
-- **Trend** - UP/DOWN/FLAT based on EMA of delta
+- **Trend** - UP/DOWN/FLAT based on EMA of delta (may reflect normal LuaJIT behavior)
 
 Click any row for detailed stats and mini-chart. Right-click unloaded addons to remove from tracking.
 
@@ -94,17 +94,21 @@ Use the **Reset UI** button (bottom-right) or `/memscope resetui` to restore the
 
 ## Alert System
 
-### Leak Detection
-Triggers when an addon shows sustained memory growth:
-- Default threshold: 10.0 KB/sec
+**Alerts are disabled by default** because most triggers are false positives from normal LuaJIT behavior (see Data Accuracy below). Enable them in Settings if you want informational notifications during addon development.
+
+### Growth Observation
+Triggers when an addon shows sustained memory increase:
+- Default threshold: 50.0 KB/sec (raised to reduce false positives)
 - Uses EMA (exponential moving average) of delta for responsive trend tracking
 - Requires 3+ samples before trend calculation begins
+- **NOTE**: LuaJIT compiles hot paths into machine code, which increases Lua memory. This is normal and expected — not a leak.
 
-### Spike Detection
+### Spike Observation
 Triggers on sudden memory jumps:
 - Default threshold: 100% increase between polls
 - Also requires minimum absolute change (default 512 KB)
 - Prevents false alarms from small addons with large percentage swings
+- **NOTE**: LuaJIT hot-path compilation can cause legitimate one-time jumps.
 
 ## Export
 
@@ -127,11 +131,27 @@ Access via the **Settings** button in the dashboard:
 | Show Addon Breakdown | true | | Display addon table |
 | Show Charts | true | | Display history charts |
 | Chart Height | 80 px | 40-150 | Height of chart widgets |
-| Enable Alerts | true | | Show leak/spike warnings in chat |
-| Leak Threshold | 10.0 KB/s | 1-200 | Sustained growth rate for leak alert |
+| Enable Alerts | false | | Show growth/spike notifications in chat (off by default — most are false positives) |
+| Growth Threshold | 50.0 KB/s | 1-200 | Sustained growth rate for informational alert |
 | Spike Threshold | 100% | 25-200 | Sudden increase percentage for spike alert |
 | Spike Min Change | 512 KB | 64-2048 | Minimum absolute change for spike alert |
 | Auto GC Monitoring | true | | Track garbage collection events |
+
+## Data Accuracy
+
+- Per-Addon Memory (Understated)
+	- The memory values from `/addon list` only reflect **Lua-tracked memory** — what the Lua VM allocates for tables, strings, functions, and other Lua objects. The following are **NOT included**:
+		- **FFI allocations** (`ffi.new`, `ffi.C.*` calls) — allocated outside the Lua GC
+		- **ImGui resources** — textures, fonts, draw lists managed by the Addons plugin
+		- **Manual C allocations** — anything allocated by native code on behalf of the addon
+		- **Addons plugin internals** — the Addons plugin's own overhead per loaded addon
+	- This means actual addon memory usage is typically **higher** than what MemScope reports.
+- Working Set (Overstated on Win10/11)
+	- Windows 10 and 11 **inflate Working Set values** compared to actual usage. The OS holds onto memory pages aggressively and delays releasing them, even when the process no longer needs them. Use the **Trim** button in the toolbar (or `/memscope trim`) to force a working set trim — actual usage is typically much lower. This uses the same `SetProcessWorkingSetSize(-1, -1)` technique from atom0s's `freemem` addon. The OS will page memory back in as needed — trimming is safe and non-destructive.
+- GC Monitoring (MemScope Only)
+	- Each Ashita addon runs in its own **isolated Lua state** with a separate garbage collector. The GC statistics shown by MemScope only reflect MemScope's own Lua VM. There is no way to trigger or observe GC in other addons from Lua.
+- Growth Alerts (Informational Only)
+	- LuaJIT compiles frequently-executed Lua code ("hot paths") into machine code. A loop or function call becomes "hot" after **56 iterations** (configurable via `hotloop`), at which point LuaJIT records and compiles a trace. The compiled machine code cache can grow up to **~2 MB** (`maxmcode = 2048 KB`). This JIT compilation **increases Lua memory usage** as compiled traces are stored. This is normal, expected behavior — not a memory leak. Since every addon running in `d3d_present` at 60fps will trigger JIT compilation quickly, most growth alerts from MemScope are false positives. The alerts are disabled by default for this reason. (See [LuaJIT Running](https://luajit.org/running.html) for full JIT parameters.)
 
 ## Technical Notes
 
@@ -143,8 +163,6 @@ Per-addon memory data comes from silently injecting `/addon list` and intercepti
 - Uses `seen_data` flag to avoid premature footer detection from startup notifications
 - Timeout safety (2 seconds) prevents hanging on missed footer
 - Only blocks chat lines during active capture; normal addon notifications pass through
-
-Note: `AddonManager` API exists in annotations but is only accessible from C++ plugins, not Lua addons.
 
 ### Memory Data Sources
 
@@ -166,11 +184,20 @@ Note: `AddonManager` API exists in annotations but is only accessible from C++ p
 
 ## Version History
 
+### v1.0.1
+- Renamed `leak_threshold` setting to `growth_threshold` (consistent with reframed "growth" language)
+- Added `Auto GC Monitoring` checkbox to Settings UI (was only configurable via settings file)
+- Added pool slot reclamation: removed addons free their tracking slot for reuse
+- Added pcall guard around text_in handler to prevent stuck reentrancy guard on error
+- Added missing state initializations (`force_export`, `remove_addon`, `session_start`)
+- Fixed unused pcall error variables, improved sort comparator naming
+
 ### v1.0.0
 - Split into 4 files (memscope, monitor, analysis, ui)
-- Per-addon memory tracking via /addon list capture with silent interception
+- Per-addon Lua memory tracking via /addon list capture with silent interception
 - Process memory monitoring via Windows FFI (working set, page file)
-- EMA trend analysis with leak/spike detection and alerts
+- EMA trend analysis with growth/spike observation (informational alerts, disabled by default)
+- Data accuracy disclaimers throughout UI
 - Historical ring buffers (720 process samples, 120 per addon)
 - Compact overlay mode with automatic window size restore on expand
 - Pause/resume data collection
