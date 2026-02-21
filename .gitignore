@@ -1,5 +1,13 @@
 # Ashita per-character settings (generated at runtime)
 settings/
 
-# Export output (user data, not source)
-exports/*.xls
+# Debug logs
+*.log
+
+# Screenshots and temp files
+*.png
+*.jpg
+*.tmp
+
+# Export files
+exports/

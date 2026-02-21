@@ -1,5 +1,5 @@
 --[[
-    MemScope v1.0.1 - Monitor Module
+    MemScope v1.0.3 - Monitor Module
     FFI for Windows memory APIs, /addon list capture, GC monitoring.
 ]]--
 
@@ -189,11 +189,6 @@ end
 function monitor.query_lua_memory()
     -- This addon's own Lua state only (not global)
     state.current.own_lua_kb = collectgarbage('count');
-
-    -- This addon's tracked memory via Ashita API
-    if addon.instance then
-        state.current.own_memory_kb = addon.instance:get_memory_usage() * BYTES_TO_KB;
-    end
 end
 
 -------------------------------------------------------------------------------

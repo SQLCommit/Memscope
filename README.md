@@ -1,4 +1,4 @@
-# MemScope v1.0.1 - Memory Monitoring Addon for Ashita v4
+# MemScope v1.0.3 - Memory Monitoring Addon for Ashita v4
 
 A memory monitoring tool that tracks per-addon Lua memory, process memory, and provides growth analysis with historical trends.
 
@@ -51,12 +51,11 @@ memscope/
   monitor.lua    -- FFI + /addon list capture + GC monitoring
   analysis.lua   -- Ring buffers, trend/growth/spike analysis, addon pool
   ui.lua         -- ImGui dashboard rendering
-  README.md      -- This file
-  LICENSE        -- MIT License
-  exports/       -- Exported .xls files (gitignored)
 ```
 
 Settings are managed by Ashita's settings module and saved per-character under `config/addons/memscope/<CharName>_<ID>/settings.lua`.
+
+Export files are written to `config/addons/memscope/exports/` (created at runtime).
 
 ## Dashboard Sections
 
@@ -112,7 +111,9 @@ Triggers on sudden memory jumps:
 
 ## Export
 
-`/memscope export` creates a SpreadsheetML `.xls` file in the `exports/` directory. Opens natively in Excel and LibreOffice with multiple worksheet tabs:
+Export path: `config/addons/memscope/exports/memscope_<CharName>_YYYYMMDD_HHMMSS.xls`
+
+`/memscope export` creates a SpreadsheetML `.xls` file with pcall-guarded writes (file handle is always closed, even on error). Opens natively in Excel and LibreOffice with multiple worksheet tabs:
 
 - **Session** - Metadata (date, duration, LAA status, system RAM) + addon summary table
 - **Process Timeline** - Full process memory history with timestamps
@@ -136,6 +137,9 @@ Access via the **Settings** button in the dashboard:
 | Spike Threshold | 100% | 25-200 | Sudden increase percentage for spike alert |
 | Spike Min Change | 512 KB | 64-2048 | Minimum absolute change for spike alert |
 | Auto GC Monitoring | true | | Track garbage collection events |
+| Show On Load | true | | Open window automatically when addon loads |
+| Background Opacity | 0.8 | 0-1 | Background transparency for compact mode (0 = fully transparent) |
+| Show Title Bar | true | | Show or hide the title bar in compact mode |
 
 ## Data Accuracy
 
@@ -172,17 +176,33 @@ Per-addon memory data comes from silently injecting `/addon list` and intercepti
 | Page File | K32GetProcessMemoryInfo (FFI) | Entire FFXI process |
 | System RAM | GlobalMemoryStatusEx (FFI) | System-wide |
 | Own Lua State | collectgarbage('count') | This addon's Lua VM only |
-| Own Tracked | addon.instance:get\_memory\_usage() | This addon only |
 | Per-Addon | /addon list capture | All loaded addons |
 
 ### Performance Design
 - **Ring buffers**: O(1) push, fixed-size, no reallocation after init
 - **Object pool**: 64 pre-allocated addon tracking slots, no GC pressure
 - **Chart buffers**: Pre-allocated arrays filled in-place each frame
+- **Pre-allocated color constants**: Delta color tables (`delta_up`, `delta_down`, `delta_flat`) are module-level constants — avoids creating `{r,g,b,a}` tables per row at 60fps
 - **Action flags**: UI sets flags, d3d_present processes them (decouples rendering from logic)
 - **Safe text_in**: Never print() from text_in handler (causes recursive crash); uses debug buffer flushed from d3d_present
 
 ## Version History
+
+### v1.0.3
+- Pre-allocated all ImGui size/position tables, style color tables, and row color constants (eliminates ~20 per-frame table allocations)
+- Removed dead `own_memory_kb` field from shared state
+- Removed stale `leak_threshold` migration cleanup from load handler
+- Added missing settings to README: Show On Load, Background Opacity, Show Title Bar
+- Added tooltips to all settings widgets and addon detail items (Chart Height, Show On Load, Enable Alerts, compact Pause/Resume, Current/Peak/Min/Samples)
+- Export: added pcall wrapping for guaranteed file handle cleanup on error (matches LootScope pattern)
+- Export: added character name to filename (`memscope_<CharName>_<timestamp>.xls`)
+- Export: added pcall at both call sites (d3d_present action flag + `/memscope export` command)
+- Fixed .gitignore to ignore entire `exports/` directory instead of only `*.xls`
+- Fixed README: export path now shows correct config directory location
+
+### v1.0.2
+- Pre-allocated delta color constants in addon table (eliminates per-row table creation at 60fps)
+- Fixed incorrect "Own Tracked" data source in README (non-existent API method removed)
 
 ### v1.0.1
 - Renamed `leak_threshold` setting to `growth_threshold` (consistent with reframed "growth" language)

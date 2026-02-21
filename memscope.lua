@@ -1,5 +1,5 @@
 --[[
-    MemScope v1.0.1 - Memory Monitoring Addon for Ashita v4
+    MemScope v1.0.3 - Memory Monitoring Addon for Ashita v4
 
     Tracks per-addon Lua memory via /addon list capture, process memory
     via Windows FFI, and provides growth analysis with historical trends.
@@ -23,12 +23,12 @@
         /memscope debug        - Debug addon list capture
 
     Author: SQLCommit
-    Version: 1.0.1
+    Version: 1.0.3
 ]]--
 
 addon.name    = 'memscope';
 addon.author  = 'SQLCommit';
-addon.version = '1.0.1';
+addon.version = '1.0.3';
 addon.desc    = 'Memory monitoring and analysis for Ashita addons';
 addon.link    = 'https://github.com/SQLCommit/memscope';
 
@@ -56,6 +56,9 @@ local default_settings = T{
     spike_threshold     = 100,
     spike_min_kb        = 512,
     auto_gc_monitoring  = true,
+    show_on_load        = true,
+    compact_bg_alpha    = 0.8,
+    compact_titlebar    = true,
 };
 
 -------------------------------------------------------------------------------
@@ -83,7 +86,6 @@ local state = {
         avail_virtual_mb = 0,
         memory_load_pct = 0,
         own_lua_kb = 0,
-        own_memory_kb = 0,
         addon_total_kb = 0,
         timestamp = 0,
     },
@@ -181,11 +183,16 @@ end
 
 local function export_session()
     -- Ensure exports/ directory exists
-    local base_dir = string_format('%s\\addons\\memscope\\exports', AshitaCore:GetInstallPath());
-    os.execute(string_format('if not exist "%s" mkdir "%s"', base_dir, base_dir));
+    local base_dir = string_format('%s\\config\\addons\\memscope\\exports', AshitaCore:GetInstallPath());
+    ashita.fs.create_directory(base_dir);
 
     local timestamp = os.date('%Y%m%d_%H%M%S');
-    local file_path = string_format('%s\\memscope_%s.xls', base_dir, timestamp);
+    local char_name = 'unknown';
+    local player = GetPlayerEntity();
+    if player and player.Name and #player.Name > 0 then
+        char_name = player.Name;
+    end
+    local file_path = string_format('%s\\memscope_%s_%s.xls', base_dir, char_name, timestamp);
 
     local f, err = io.open(file_path, 'w');
     if not f then
@@ -201,6 +208,9 @@ local function export_session()
     local HISTORY_SIZE = analysis.HISTORY_SIZE;
     local ADDON_HISTORY_SIZE = analysis.ADDON_HISTORY_SIZE;
     local sheet_count = 0;
+
+    -- Wrap all writes in pcall so f:close() is guaranteed even on error
+    local write_ok, write_err = pcall(function()
 
     -- XML header (SpreadsheetML — opens natively in Excel/LibreOffice with tabs)
     f:write('<?xml version="1.0" encoding="UTF-8"?>\n');
@@ -384,10 +394,18 @@ local function export_session()
 
     -- Close workbook
     f:write('</Workbook>\n');
+
+    end); -- pcall
+
     f:close();
 
-    msg(string_format('Exported %d tabs to exports\\memscope_%s.xls',
-        sheet_count, timestamp));
+    if not write_ok then
+        msg_warning(string_format('Export write failed: %s', tostring(write_err)));
+        return;
+    end
+
+    msg(string_format('Exported %d tabs to exports\\memscope_%s_%s.xls',
+        sheet_count, char_name, timestamp));
 end
 
 -------------------------------------------------------------------------------
@@ -425,6 +443,11 @@ ashita.events.register('load', 'memscope_load', function()
     monitor.init(state);
     ui.init(state, analysis, default_settings);
 
+    -- Apply show_on_load setting
+    if (not state.settings.show_on_load) then
+        ui.hide();
+    end
+
     collect_sample();
 
     -- Schedule the first addon poll ~3 seconds from now via d3d_present timing.
@@ -434,7 +457,7 @@ ashita.events.register('load', 'memscope_load', function()
     state.last_sample_time = now;
     state.last_addon_poll_time = now - state.settings.addon_poll_interval + 3;
 
-    msg('v1.0.1 loaded. Use /memscope to toggle window.');
+    msg('v1.0.3 loaded. Use /memscope to toggle window.');
 end);
 
 -------------------------------------------------------------------------------
@@ -492,16 +515,16 @@ ashita.events.register('command', 'memscope_command', function(e)
 
     elseif cmd == 'report' then
         msg('Memory Report:');
-        print(string_format('  Process: %.1f MB (peak %.1f MB)',
+        msg(string_format('  Process: %.1f MB (peak %.1f MB)',
             state.current.working_set_mb, state.current.peak_working_set_mb));
-        print(string_format('  MemScope Lua: %.2f KB', state.current.own_lua_kb));
-        print(string_format('  All Addons: %.2f KB', state.current.addon_total_kb));
-        print(string_format('  Tracked Addons: %d', #state.addon_order));
+        msg(string_format('  MemScope Lua: %.2f KB', state.current.own_lua_kb));
+        msg(string_format('  All Addons: %.2f KB', state.current.addon_total_kb));
+        msg(string_format('  Tracked Addons: %d', #state.addon_order));
         for i = 1, math_min(5, #state.addon_order) do
             local name = state.addon_order[i];
             local data = state.addons[name];
             if data then
-                print(string_format('    %s: %.2f KB (%s)', data.name, data.memory_kb, data.status));
+                msg(string_format('    %s: %.2f KB (%s)', data.name, data.memory_kb, data.status));
             end
         end
 
@@ -527,7 +550,10 @@ ashita.events.register('command', 'memscope_command', function(e)
         end
 
     elseif cmd == 'export' then
-        export_session();
+        local ok, err = pcall(export_session);
+        if not ok then
+            msg_warning(string_format('Export failed: %s', tostring(err)));
+        end
 
     elseif cmd == 'pause' then
         state.paused = not state.paused;
@@ -545,19 +571,24 @@ ashita.events.register('command', 'memscope_command', function(e)
         monitor.start_debug_capture();
 
     elseif cmd == 'help' then
-        msg('Commands:');
-        print('  /memscope [toggle] - Toggle window');
-        print('  /memscope show/hide - Show/hide window');
-        print('  /memscope compact - Toggle compact mode');
-        print('  /memscope resetui - Reset window size and position');
-        print('  /memscope pause - Pause/resume data collection');
-        print('  /memscope snapshot - Take manual snapshot');
-        print('  /memscope report - Print memory report');
-        print('  /memscope export - Export session data to Excel (.xls)');
-        print('  /memscope gc - Force garbage collection (this addon only)');
-        print('  /memscope trim - Trim working set (shows actual vs inflated memory)');
-        print('  /memscope alerts [on/off] - Toggle growth alerts');
-        print('  /memscope debug - Debug addon list capture');
+        msg('Available commands:');
+        local cmds = {
+            { '/memscope',              'Toggle the MemScope window.' },
+            { '/memscope show / hide',  'Show or hide the window.' },
+            { '/memscope compact',      'Toggle compact overlay mode.' },
+            { '/memscope resetui',      'Reset window size and position.' },
+            { '/memscope pause',        'Pause/resume data collection.' },
+            { '/memscope snapshot',     'Take manual memory snapshot.' },
+            { '/memscope report',       'Print memory report to chat.' },
+            { '/memscope export',       'Export session data to Excel (.xls).' },
+            { '/memscope gc',           'Force garbage collection (this addon only).' },
+            { '/memscope trim',         'Trim working set (actual vs inflated memory).' },
+            { '/memscope alerts [on/off]', 'Toggle growth alerts.' },
+            { '/memscope debug',        'Debug addon list capture.' },
+        };
+        for _, v in ipairs(cmds) do
+            print(chat.header('MemScope') .. chat.success(v[1]) .. chat.message(' - ' .. v[2]));
+        end
 
     else
         msg_warning('Unknown command. Use /memscope help');
@@ -570,9 +601,18 @@ end);
 ashita.events.register('d3d_present', 'memscope_render', function()
     local now = os_clock();
 
-    -- Check for capture timeout + flush debug log
+    -- Check for capture timeout + flush debug log (always, even at char select)
     monitor.check_capture_timeout();
     monitor.flush_debug_log();
+
+    -- Don't collect data or render until character is in a zone
+    local player = GetPlayerEntity();
+    if (player == nil) then return; end
+    local mem = AshitaCore:GetMemoryManager();
+    if (mem == nil) then return; end
+    local party = mem:GetParty();
+    if (party == nil) then return; end
+    if ((party:GetMemberZone(0) or 0) == 0) then return; end
 
     -- Handle action flags from UI
     if state.force_refresh then
@@ -605,7 +645,10 @@ ashita.events.register('d3d_present', 'memscope_render', function()
 
     if state.force_export then
         state.force_export = false;
-        export_session();
+        local ok, err = pcall(export_session);
+        if not ok then
+            msg_warning(string_format('Export failed: %s', tostring(err)));
+        end
     end
 
     if state.remove_addon then

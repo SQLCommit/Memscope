@@ -1,5 +1,5 @@
 --[[
-    MemScope v1.0.1 - UI Module
+    MemScope v1.0.3 - UI Module
     ImGui dashboard rendering with correct widget patterns.
 
     Data accuracy notes (per atom0s, Feb 2026):
@@ -26,6 +26,17 @@ local math_min = math.min;
 local string_format = string.format;
 
 -------------------------------------------------------------------------------
+-- Colors (matching PlayerNotes convention)
+-------------------------------------------------------------------------------
+local colors = {
+    header     = { 1.0, 0.65, 0.26, 1.0 },  -- orange section titles
+    muted      = { 0.6, 0.6, 0.6, 1.0 },
+    delta_up   = { 1, 0.5, 0.5, 1 },         -- memory growing (red-ish)
+    delta_down = { 0.5, 1, 0.5, 1 },         -- memory shrinking (green-ish)
+    delta_flat = { 0.7, 0.7, 0.7, 1 },       -- no change (gray)
+};
+
+-------------------------------------------------------------------------------
 -- Module State
 -------------------------------------------------------------------------------
 local state = nil;
@@ -38,6 +49,9 @@ local show_settings = { false };
 local compact_mode = false;
 local restore_full_size = false;
 local reset_pending = false;
+local saved_full_size = nil;       -- { w, h } captured before entering compact
+local saved_compact_size = nil;    -- { w, h } captured before entering full
+local restore_compact_size = false;
 
 -- Pre-allocated chart buffers (filled in-place each frame, no allocation)
 local CHART_BUFFER_SIZE = 120;
@@ -49,6 +63,30 @@ for i = 1, CHART_BUFFER_SIZE do
     addon_chart[i] = 0;
     addon_detail_chart[i] = 0;
 end
+
+-- Pre-allocated ImGui size/position tables (updated in-place, no per-frame allocation)
+local size_bar         = { -1, 0 };      -- progress bar: full width, auto height
+local size_content     = { 0, -26 };     -- scrollable content: full width, reserve footer
+local size_chart       = { 0, 0 };       -- chart: { content_width, chart_height }
+local size_table       = { 0, 0 };       -- addon table: { 0, table_height }
+local size_detail      = { 0, 60 };      -- addon detail chart: { content_width, 60 }
+local size_default     = { 460, 520 };   -- default full window size
+local pos_default      = { 100, 100 };   -- default full window position
+local size_compact_def = { 280, 160 };   -- default compact window size
+local size_restore     = { 0, 0 };       -- temp: size restore on mode switch
+
+-- Pre-allocated compact mode style color tables (updated in-place via scaled_color)
+local cc_border        = { 0, 0, 0, 0 };
+local cc_border_shadow = { 0, 0, 0, 0 };
+local cc_grip          = { 0, 0, 0, 0 };
+local cc_grip_hover    = { 0, 0, 0, 0 };
+local cc_grip_active   = { 0, 0, 0, 0 };
+
+-- Pre-allocated row/button color tables (addon table + toolbar)
+local color_unloaded   = { 0.5, 0.5, 0.5, 0.6 };
+local color_alert      = { 1.0, 0.6, 0.2, 1.0 };
+local color_self       = { 0.5, 0.8, 0.5, 1.0 };
+local color_reset_btn  = { 0.3, 0.3, 0.3, 1.0 };
 
 -------------------------------------------------------------------------------
 -- Helpers
@@ -94,7 +132,7 @@ local function render_process_memory()
     local is_laa = vlimit > 2200;  -- LAA = ~4096 MB, non-LAA = ~2048 MB
     local laa_label = is_laa and 'LAA' or '32-bit';
 
-    imgui.Text(string_format('Process Memory (%s, %.0f MB limit)', laa_label, vlimit));
+    imgui.TextColored(colors.header, string_format('Process Memory (%s, %.0f MB limit)', laa_label, vlimit));
     help_marker(
         'Memory used by the entire FFXI process.\n' ..
         'FFXI is 32-bit: 2 GB limit (4 GB with LAA patch).\n' ..
@@ -102,8 +140,8 @@ local function render_process_memory()
         'NOTE: Windows 10/11 inflates Working Set values.\n' ..
         'The OS holds onto memory pages aggressively and\n' ..
         'delays releasing them. Actual usage may be much\n' ..
-        'lower than reported. Use the Trim button above\n' ..
-        'to force a working set trim for accurate readings.'
+        'lower than reported. Use the Trim button in the\n' ..
+        'toolbar to force a working set trim for accurate readings.'
     );
     imgui.Separator();
 
@@ -122,7 +160,7 @@ local function render_process_memory()
         );
     end
     imgui.SameLine();
-    imgui.ProgressBar(ws_pct, { -1, 0 }, ws_label);
+    imgui.ProgressBar(ws_pct, size_bar, ws_label);
     if imgui.IsItemHovered() then
         imgui.SetTooltip(string_format(
             'Current: %.1f MB\n' ..
@@ -151,7 +189,7 @@ local function render_process_memory()
         imgui.SetTooltip('Virtual memory committed (RAM + swap reserved for FFXI).');
     end
     imgui.SameLine();
-    imgui.ProgressBar(pf_pct, { -1, 0 }, pf_label);
+    imgui.ProgressBar(pf_pct, size_bar, pf_label);
     if imgui.IsItemHovered() then
         imgui.SetTooltip(string_format(
             'Current: %.1f MB\n' ..
@@ -180,7 +218,7 @@ end
 -- Lua Memory Section
 -------------------------------------------------------------------------------
 local function render_lua_memory()
-    imgui.Text('Lua Memory');
+    imgui.TextColored(colors.header, 'Lua Memory');
     help_marker(
         'Memory tracked by Lua addon scripts.\n' ..
         'Each addon runs in its own isolated Lua state.\n' ..
@@ -233,7 +271,7 @@ end
 local function render_addon_table()
     if not state.settings.show_addon_breakdown then return; end
 
-    imgui.Text(string_format('Addon Memory (%d tracked)', #state.addon_order));
+    imgui.TextColored(colors.header, string_format('Addon Memory (%d tracked)', #state.addon_order));
     help_marker(
         'Click a row for details. Right-click unloaded addons to remove.\n\n' ..
         'Values are Lua-tracked memory only (from /addon list).\n' ..
@@ -255,7 +293,8 @@ local function render_addon_table()
     local header_height = row_height + 4;
     local table_height = header_height + (row_height * math.min(#state.addon_order, max_rows));
 
-    if not imgui.BeginTable('addon_table', 5, table_flags, { 0, table_height }) then return; end
+    size_table[2] = table_height;
+    if not imgui.BeginTable('addon_table', 5, table_flags, size_table) then return; end
 
     imgui.TableSetupScrollFreeze(0, 1);
     imgui.TableSetupColumn('Name',   ImGuiTableColumnFlags_WidthStretch + ImGuiTableColumnFlags_PreferSortAscending, 0, 0);
@@ -265,19 +304,17 @@ local function render_addon_table()
     imgui.TableSetupColumn('Trend',  ImGuiTableColumnFlags_WidthFixed + ImGuiTableColumnFlags_PreferSortDescending, 50, 4);
     imgui.TableHeadersRow();
 
-    -- Handle sort spec changes
+    -- Handle sort spec changes (SpecsDirty may not be writable from Lua bindings)
     local sort_specs = imgui.TableGetSortSpecs();
-    if sort_specs then
+    if sort_specs and sort_specs.SpecsDirty then
         local spec = sort_specs.Specs;
         if spec then
-            local col = spec.ColumnUserID;
-            local asc = spec.SortDirection == ImGuiSortDirection_Ascending;
-            if col ~= state.sort_col or asc ~= state.sort_asc then
-                state.sort_col = col;
-                state.sort_asc = asc;
-                analysis.sort_addons(col, asc);
-            end
+            state.sort_col = spec.ColumnUserID;
+            state.sort_asc = spec.SortDirection == ImGuiSortDirection_Ascending;
+            analysis.sort_addons(state.sort_col, state.sort_asc);
         end
+        -- Note: SpecsDirty assignment may be no-op if read-only in Ashita's binding
+        sort_specs.SpecsDirty = false;
     end
 
     for _, name in ipairs(state.addon_order) do
@@ -288,13 +325,13 @@ local function render_addon_table()
             local is_unloaded = data.status == 'Unloaded';
             local needs_pop = false;
             if is_unloaded then
-                imgui.PushStyleColor(ImGuiCol_Text, { 0.5, 0.5, 0.5, 0.6 });
+                imgui.PushStyleColor(ImGuiCol_Text, color_unloaded);
                 needs_pop = true;
             elseif data.alert_active then
-                imgui.PushStyleColor(ImGuiCol_Text, { 1.0, 0.6, 0.2, 1.0 });
+                imgui.PushStyleColor(ImGuiCol_Text, color_alert);
                 needs_pop = true;
             elseif name == addon.name then
-                imgui.PushStyleColor(ImGuiCol_Text, { 0.5, 0.8, 0.5, 1.0 });
+                imgui.PushStyleColor(ImGuiCol_Text, color_self);
                 needs_pop = true;
             end
 
@@ -324,14 +361,9 @@ local function render_addon_table()
 
             -- Delta
             imgui.TableNextColumn();
-            local delta_color;
-            if data.last_delta > 0.1 then
-                delta_color = { 1, 0.5, 0.5, 1 };
-            elseif data.last_delta < -0.1 then
-                delta_color = { 0.5, 1, 0.5, 1 };
-            else
-                delta_color = { 0.7, 0.7, 0.7, 1 };
-            end
+            local delta_color = data.last_delta > 0.1 and colors.delta_up
+                or data.last_delta < -0.1 and colors.delta_down
+                or colors.delta_flat;
             imgui.TextColored(delta_color, string_format('%+.2f', data.last_delta));
 
             -- Trend
@@ -389,7 +421,7 @@ local function render_charts()
     local h = state.history;
     if h.count < 2 then return; end
 
-    imgui.Text('Memory Over Time');
+    imgui.TextColored(colors.header, 'Memory Over Time');
     help_marker('Historical graphs. Hover for values. Updates every sample interval.');
     imgui.Separator();
 
@@ -407,10 +439,11 @@ local function render_charts()
         ws_chart[i] = h.working_set[idx];
     end
 
+    size_chart[1] = content_width; size_chart[2] = chart_height;
     imgui.PlotLines('##ws_chart', ws_chart, count, 0,
         string_format('Working Set (%.1f / %.0f MB)', state.current.working_set_mb, vlimit),
         0, vlimit,
-        { content_width, chart_height });
+        size_chart);
     render_time_scale(count, sample_iv, content_width);
 
     -- Fill addon total chart buffer in-place (converted to MB for readable hover tooltips)
@@ -426,7 +459,7 @@ local function render_charts()
     imgui.PlotLines('##addon_chart', addon_chart, count, 0,
         string_format('All Addons (%s)', fmt_mem(total_kb)),
         0, math_max(max_addon * 1.1, 0.1),
-        { content_width, chart_height });
+        size_chart);
     render_time_scale(count, sample_iv, content_width);
 
     imgui.Spacing();
@@ -446,8 +479,17 @@ local function render_addon_detail()
     imgui.Indent();
 
     imgui.Text(string_format('Current: %s', fmt_mem(data.memory_kb)));
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip('Latest Lua-tracked memory for this addon.');
+    end
     imgui.Text(string_format('Peak: %s', fmt_mem(data.peak_kb)));
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip('Highest Lua-tracked memory observed this session.');
+    end
     imgui.Text(string_format('Min: %s', fmt_mem(data.min_kb == analysis.MIN_KB_SENTINEL and 0 or data.min_kb)));
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip('Lowest Lua-tracked memory observed this session.');
+    end
     imgui.Text(string_format('Trend: %.3f KB/sec', data.trend_slope));
     if imgui.IsItemHovered() then
         imgui.SetTooltip(
@@ -461,6 +503,9 @@ local function render_addon_detail()
         );
     end
     imgui.Text(string_format('Samples: %d', data.history_count));
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip(string_format('Number of data points collected (max %d).\nOne sample per addon poll interval.', analysis.ADDON_HISTORY_SIZE));
+    end
 
     if data.history_count >= 2 then
         local detail_count = math_min(data.history_count, CHART_BUFFER_SIZE);
@@ -471,10 +516,11 @@ local function render_addon_detail()
         end
 
         local content_width = imgui.GetContentRegionAvail();
+        size_detail[1] = content_width;
         imgui.PlotLines('##addon_detail', addon_detail_chart, detail_count, 0,
             nil,
             math_max(data.min_kb * KB_TO_MB * 0.9, 0), math_max(data.peak_kb * KB_TO_MB * 1.1, 0.01),
-            { content_width, 60 });
+            size_detail);
         render_time_scale(detail_count, state.settings.addon_poll_interval, content_width);
     end
 
@@ -488,7 +534,7 @@ local function render_settings()
     if not show_settings[1] then return; end
 
     if imgui.Begin('MemScope Settings', show_settings, ImGuiWindowFlags_AlwaysAutoResize) then
-        imgui.Text('Sampling');
+        imgui.TextColored(colors.header, 'Sampling');
         imgui.Separator();
 
         local v;
@@ -512,7 +558,7 @@ local function render_settings()
         end
 
         imgui.Spacing();
-        imgui.Text('Display');
+        imgui.TextColored(colors.header, 'Display');
         imgui.Separator();
 
         v = { state.settings.show_process_memory };
@@ -547,6 +593,9 @@ local function render_settings()
             state.settings.chart_height = v[1];
             state.settings_save_requested = true;
         end
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Height in pixels for the memory history charts.\nLarger = more detail, smaller = saves space.');
+        end
 
         v = { state.settings.auto_gc_monitoring };
         if imgui.Checkbox('Auto GC Monitoring', v) then
@@ -558,7 +607,20 @@ local function render_settings()
         end
 
         imgui.Spacing();
-        imgui.Text('Alerts');
+        imgui.TextColored(colors.header, 'Startup');
+        imgui.Separator();
+
+        v = { state.settings.show_on_load };
+        if imgui.Checkbox('Open window when addon loads', v) then
+            state.settings.show_on_load = v[1];
+            state.settings_save_requested = true;
+        end
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Automatically open the MemScope window when the addon loads.\nUncheck to start hidden (use /memscope to open later).');
+        end
+
+        imgui.Spacing();
+        imgui.TextColored(colors.header, 'Alerts');
         help_marker(
             'Alerts notify you in chat about unusual memory patterns.\n' ..
             'Growth: sustained increase detected via EMA of delta.\n' ..
@@ -574,6 +636,9 @@ local function render_settings()
         if imgui.Checkbox('Enable Alerts', v) then
             state.settings.alerts_enabled = v[1];
             state.settings_save_requested = true;
+        end
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Print growth/spike alerts to chat.\nOff by default — most alerts are false positives from LuaJIT.');
         end
 
         v = { state.settings.growth_threshold };
@@ -619,6 +684,28 @@ local function render_settings()
         end
 
         imgui.Spacing();
+        imgui.TextColored(colors.header, 'Compact Mode');
+        imgui.Separator();
+
+        v = { state.settings.compact_bg_alpha or 0.8 };
+        if imgui.SliderFloat('Background Opacity', v, 0.0, 1.0, '%.2f') then
+            state.settings.compact_bg_alpha = v[1];
+            state.settings_save_requested = true;
+        end
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Background transparency for compact mode.\n0 = fully transparent, 1 = fully opaque.');
+        end
+
+        v = { state.settings.compact_titlebar ~= false };
+        if imgui.Checkbox('Show Title Bar', v) then
+            state.settings.compact_titlebar = v[1];
+            state.settings_save_requested = true;
+        end
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Show or hide the window title bar in compact mode.\nThe window is still draggable without it.');
+        end
+
+        imgui.Spacing();
         if defaults and imgui.Button('Restore Defaults') then
             for k, v in pairs(defaults) do
                 state.settings[k] = v;
@@ -636,17 +723,53 @@ end
 -------------------------------------------------------------------------------
 -- Compact Mode Window
 -------------------------------------------------------------------------------
-local function render_compact()
-    imgui.SetNextWindowSize({ 280, 0 }, ImGuiCond_FirstUseEver);
 
-    if imgui.Begin('MemScope', is_open, ImGuiWindowFlags_AlwaysAutoResize + ImGuiWindowFlags_NoScrollbar) then
+--- Read a theme color into a pre-allocated table with alpha scaled.
+local function scaled_color(tbl, idx, a)
+    local r, g, b, ca = imgui.GetStyleColorVec4(idx);
+    tbl[1] = r; tbl[2] = g; tbl[3] = b; tbl[4] = ca * a;
+    return tbl;
+end
+
+local function render_compact()
+    if restore_compact_size and saved_compact_size then
+        restore_compact_size = false;
+        size_restore[1] = saved_compact_size[1]; size_restore[2] = saved_compact_size[2];
+        imgui.SetNextWindowSize(size_restore, ImGuiCond_Always);
+    elseif restore_compact_size then
+        restore_compact_size = false;
+        imgui.SetNextWindowSize(size_compact_def, ImGuiCond_Always);
+    else
+        imgui.SetNextWindowSize(size_compact_def, ImGuiCond_FirstUseEver);
+    end
+
+    -- Configurable background opacity
+    local bg_alpha = state.settings.compact_bg_alpha or 0.8;
+    imgui.SetNextWindowBgAlpha(bg_alpha);
+
+    -- Scale UI element colors by opacity (pre-allocated tables, updated in-place)
+    local a = bg_alpha;
+    local style_count = 0;
+    imgui.PushStyleColor(ImGuiCol_Border,               scaled_color(cc_border,        ImGuiCol_Border, a));               style_count = style_count + 1;
+    imgui.PushStyleColor(ImGuiCol_BorderShadow,         scaled_color(cc_border_shadow, ImGuiCol_BorderShadow, a));         style_count = style_count + 1;
+    imgui.PushStyleColor(ImGuiCol_ResizeGrip,           scaled_color(cc_grip,          ImGuiCol_ResizeGrip, a));           style_count = style_count + 1;
+    imgui.PushStyleColor(ImGuiCol_ResizeGripHovered,    scaled_color(cc_grip_hover,    ImGuiCol_ResizeGripHovered, a));    style_count = style_count + 1;
+    imgui.PushStyleColor(ImGuiCol_ResizeGripActive,     scaled_color(cc_grip_active,   ImGuiCol_ResizeGripActive, a));     style_count = style_count + 1;
+
+    -- Window flags: optional title bar
+    local win_flags = ImGuiWindowFlags_NoScrollbar;
+    if state.settings.compact_titlebar == false then
+        win_flags = win_flags + ImGuiWindowFlags_NoTitleBar;
+    end
+
+    if imgui.Begin('MemScope', is_open, win_flags) then
         local c = state.current;
         local vlimit = math_max(c.total_virtual_mb, 1);
 
         -- Working set bar
         local ws_pct = c.working_set_mb / vlimit;
         local ws_label = string_format('%.0f / %.0f MB', c.working_set_mb, vlimit);
-        imgui.ProgressBar(ws_pct, { -1, 0 }, ws_label);
+        imgui.ProgressBar(ws_pct, size_bar, ws_label);
         if imgui.IsItemHovered() then
             imgui.SetTooltip(string_format(
                 'Working Set: %.1f MB (Peak: %.1f MB)\n' ..
@@ -675,15 +798,24 @@ local function render_compact()
         if imgui.SmallButton(state.paused and 'Resume' or 'Pause') then
             state.paused = not state.paused;
         end
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip(state.paused and 'Resume data collection.' or 'Pause data collection.');
+        end
         imgui.SameLine();
-        if imgui.SmallButton('Expand') then
+        local bw = imgui.GetContentRegionAvail();
+        imgui.SameLine(imgui.GetCursorPosX() + bw - 38);
+        if imgui.SmallButton('>>') then
+            local w, h = imgui.GetWindowSize();
+            if (not saved_compact_size) then saved_compact_size = { 0, 0 }; end
+            saved_compact_size[1] = w; saved_compact_size[2] = h;
             compact_mode = false;
             restore_full_size = true;
         end
         if imgui.IsItemHovered() then
-            imgui.SetTooltip('Switch to full dashboard');
+            imgui.SetTooltip('Expand to full dashboard');
         end
     end
+    imgui.PopStyleColor(style_count);
     imgui.End();
 end
 
@@ -694,17 +826,25 @@ local function render_full()
     if reset_pending then
         reset_pending = false;
         restore_full_size = false;
-        imgui.SetNextWindowSize({ 460, 520 }, ImGuiCond_Always);
-        imgui.SetNextWindowPos({ 100, 100 }, ImGuiCond_Always);
+        saved_full_size = nil;
+        saved_compact_size = nil;
+        imgui.SetNextWindowSize(size_default, ImGuiCond_Always);
+        imgui.SetNextWindowPos(pos_default, ImGuiCond_Always);
     elseif restore_full_size then
         restore_full_size = false;
-        imgui.SetNextWindowSize({ 460, 520 }, ImGuiCond_Always);
+        if (saved_full_size) then
+            size_restore[1] = saved_full_size[1]; size_restore[2] = saved_full_size[2];
+        else
+            size_restore[1] = size_default[1]; size_restore[2] = size_default[2];
+        end
+        saved_full_size = nil;
+        imgui.SetNextWindowSize(size_restore, ImGuiCond_Always);
     else
-        imgui.SetNextWindowSize({ 460, 520 }, ImGuiCond_FirstUseEver);
+        imgui.SetNextWindowSize(size_default, ImGuiCond_FirstUseEver);
     end
 
     if imgui.Begin('MemScope', is_open, ImGuiWindowFlags_NoScrollbar + ImGuiWindowFlags_NoScrollWithMouse) then
-        -- Toolbar: [Pause] [Refresh] | [Export] [GC] [Trim] | [Settings] [Compact]  Samples
+        -- Toolbar: [Pause] [Refresh] | [GC] [Trim] | [Export] [Compact]
         if imgui.Button(state.paused and 'Resume' or 'Pause') then
             state.paused = not state.paused;
         end
@@ -720,13 +860,6 @@ local function render_full()
         end
         imgui.SameLine();
         imgui.TextDisabled('|');
-        imgui.SameLine();
-        if imgui.Button('Export') then
-            state.force_export = true;
-        end
-        if imgui.IsItemHovered() then
-            imgui.SetTooltip('Export session data to Excel workbook (.xls).');
-        end
         imgui.SameLine();
         if imgui.Button('GC') then
             state.force_gc = true;
@@ -753,29 +886,28 @@ local function render_full()
         imgui.SameLine();
         imgui.TextDisabled('|');
         imgui.SameLine();
-        if imgui.Button('Settings') then
-            show_settings[1] = not show_settings[1];
+        if imgui.Button('Export') then
+            state.force_export = true;
         end
         if imgui.IsItemHovered() then
-            imgui.SetTooltip('Configure sampling, display, and alert thresholds.');
+            imgui.SetTooltip('Export session data to Excel workbook (.xls).');
         end
         imgui.SameLine();
         if imgui.Button('Compact') then
+            local w, h = imgui.GetWindowSize();
+            if (not saved_full_size) then saved_full_size = { 0, 0 }; end
+            saved_full_size[1] = w; saved_full_size[2] = h;
             compact_mode = true;
+            restore_compact_size = true;
         end
         if imgui.IsItemHovered() then
             imgui.SetTooltip('Switch to compact overlay.');
         end
-        imgui.SameLine();
-        imgui.TextDisabled(string_format('| %d', state.history.count));
-        if imgui.IsItemHovered() then
-            imgui.SetTooltip('Total process memory samples collected this session.');
-        end
 
         imgui.Separator();
 
-        -- Scrollable content area (reserves 26px at bottom for footer)
-        imgui.BeginChild('##content', { 0, -26 });
+        -- Scrollable content area (reserves 26px at bottom for status bar)
+        imgui.BeginChild('##content', size_content);
             render_process_memory();
             render_lua_memory();
             render_addon_table();
@@ -783,11 +915,24 @@ local function render_full()
             render_addon_detail();
         imgui.EndChild();
 
-        -- Footer (fixed, outside scroll area)
+        -- Status bar (fixed, outside scroll area) — matches PlayerNotes pattern
         imgui.Separator();
+        imgui.TextColored(colors.muted, string_format('%d samples | %d addons', state.history.count, #state.addon_order));
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Process memory samples collected this session\nand number of tracked addons.');
+        end
+
+        local cursor_x = imgui.GetCursorPosX();
         local avail_w = imgui.GetContentRegionAvail();
-        imgui.SameLine(imgui.GetCursorPosX() + avail_w - 90);
-        imgui.PushStyleColor(ImGuiCol_Button, { 0.3, 0.3, 0.3, 1.0 });
+        imgui.SameLine(cursor_x + avail_w - 175);
+        if imgui.Button('Settings') then
+            show_settings[1] = not show_settings[1];
+        end
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Configure sampling, display, and alert thresholds.');
+        end
+        imgui.SameLine();
+        imgui.PushStyleColor(ImGuiCol_Button, color_reset_btn);
         if imgui.Button('Reset UI') then
             reset_pending = true;
         end
@@ -806,6 +951,8 @@ end
 -------------------------------------------------------------------------------
 function ui.render()
     if not is_open[1] then return; end
+
+    -- Login gate is handled by d3d_present in memscope.lua — no duplicate check needed here
 
     if compact_mode then
         render_compact();
@@ -835,13 +982,17 @@ end
 
 function ui.toggle_compact()
     compact_mode = not compact_mode;
-    if not compact_mode then
+    if compact_mode then
+        restore_compact_size = true;
+    else
         restore_full_size = true;
     end
 end
 
 function ui.reset_ui()
     compact_mode = false;
+    saved_full_size = nil;
+    saved_compact_size = nil;
     reset_pending = true;
 end
 

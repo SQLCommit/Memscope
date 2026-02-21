@@ -1,5 +1,5 @@
 --[[
-    MemScope v1.0.1 - Analysis Engine
+    MemScope v1.0.3 - Analysis Engine
     Ring buffers, trend analysis, growth/spike observation, addon pool management.
 
     NOTE: Per-addon memory from /addon list only reflects Lua-tracked memory.
@@ -42,23 +42,6 @@ analysis.ADDON_HISTORY_SIZE = ADDON_HISTORY_SIZE;
 analysis.MAX_TRACKED_ADDONS = MAX_TRACKED_ADDONS;
 analysis.MIN_SAMPLES_FOR_TREND = MIN_SAMPLES_FOR_TREND;
 analysis.MIN_KB_SENTINEL = MIN_KB_SENTINEL;
-
--------------------------------------------------------------------------------
--- Ring Buffer Operations (zero allocation after init)
--------------------------------------------------------------------------------
-function analysis.ring_push(ring, value, max_size)
-    ring[ring.head] = value;
-    ring.head = ring.head % max_size + 1;
-    if ring.count < max_size then
-        ring.count = ring.count + 1;
-    end
-end
-
-function analysis.ring_get(ring, index, max_size)
-    if index < 1 or index > ring.count then return nil; end
-    local actual = (ring.head - ring.count + index - 2) % max_size + 1;
-    return ring[actual];
-end
 
 -------------------------------------------------------------------------------
 -- Initialization
