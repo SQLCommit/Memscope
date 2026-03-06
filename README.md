@@ -1,4 +1,4 @@
-# MemScope v1.0.3 - Memory Monitoring Addon for Ashita v4
+# MemScope v1.0.3 - Memory Monitoring Addon for Ashita v4.3
 
 A memory monitoring tool that tracks per-addon Lua memory, process memory, and provides growth analysis with historical trends.
 
@@ -16,8 +16,8 @@ A memory monitoring tool that tracks per-addon Lua memory, process memory, and p
 
 ## Requirements
 
-- Ashita v4.30
-	- This release has only been tested with Ashita v4.30
+- Ashita v4.3.0.2
+	- This release has only been tested with Ashita v4.3.0.2
 
 ## Installation
 
